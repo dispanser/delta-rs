@@ -44,7 +44,7 @@ lazy_static! {
     static ref TABLE_PATH: String = format!("s3://my_delta_table_{}", uuid::Uuid::new_v4());
 }
 
-#[ctor::ctor]
+// #[ctor::ctor]
 fn prepare_dynamodb() {
     let _context = IntegrationContext::new(StorageIntegration::Amazon).unwrap();
     tokio::runtime::Builder::new_current_thread()
@@ -62,6 +62,7 @@ fn client_config_picks_up_lock_table_name() {
 }
 
 #[tokio::test]
+#[serial]
 async fn get_missing_item() -> TestResult<()> {
     let client = &CLIENT;
     let version = i64::MAX;
@@ -83,7 +84,8 @@ async fn test_append() -> TestResult<()> {
 
 #[tokio::test]
 #[serial]
-async fn test_repair() -> TestResult<()> {
+async fn test_repair_incomplete_commits() -> TestResult<()> {
+    prepare_dynamodb();
     let context = IntegrationContext::new(StorageIntegration::Amazon)?;
     let table = prepare_table(&context, "repair_needed").await?;
     let options: StorageOptions = OPTIONS.clone().into();
@@ -142,8 +144,8 @@ async fn test_repair_on_update() -> TestResult<()> {
     Ok(())
 }
 
-const WORKERS: i64 = 3;
-const COMMITS: i64 = 5;
+const WORKERS: i32 = 3;
+const COMMITS: i32 = 5;
 
 #[tokio::test]
 #[serial]
@@ -159,7 +161,7 @@ async fn test_concurrent_writers() -> TestResult<()> {
     }
     let mut futures = Vec::new();
     for mut w in workers {
-        let run = tokio::spawn(async move { w.commit_sequence(COMMITS).await });
+        let run = tokio::spawn(async move { w.commit_sequence(COMMITS as i64).await });
         futures.push(run)
     }
 
@@ -167,7 +169,7 @@ async fn test_concurrent_writers() -> TestResult<()> {
     for f in futures {
         map.extend(f.await?);
     }
-    validate_lock_table_state(&table, WORKERS * COMMITS).await?;
+    validate_lock_table_state(&table, (WORKERS * COMMITS) as i64).await?;
     Ok(())
 }
 

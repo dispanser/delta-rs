@@ -5,15 +5,12 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use object_store::path::Path;
-use rusoto_core::{HttpClient, RusotoError};
-use rusoto_credential::AutoRefreshingProvider;
-use rusoto_dynamodb::{
-    AttributeDefinition, AttributeValue, CreateTableError, CreateTableInput, DynamoDb,
-    DynamoDbClient, GetItemInput, KeySchemaElement, PutItemError, PutItemInput, QueryInput,
-    UpdateItemError, UpdateItemInput,
+use aws_sdk_dynamodb::{
+    client::Client,
+    error::SdkError,
+    types::{AttributeDefinition, AttributeValue, KeySchemaElement, KeyType, ScalarAttributeType},
 };
-use rusoto_sts::WebIdentityProvider;
+use object_store::path::Path;
 
 use crate::{logstore::extract_version_from_filename, storage::s3::S3StorageOptions};
 
@@ -25,7 +22,7 @@ use super::{
 /// Lock client backed by DynamoDb.
 pub struct DynamoDbLockClient {
     /// DynamoDb client
-    dynamodb_client: DynamoDbClient,
+    dynamodb_client: Client,
     /// configuration of the
     config: DynamoDbConfig,
 }
@@ -35,7 +32,23 @@ impl DynamoDbLockClient {
     ///
     /// Options are described in [s3_storage_options].
     pub fn try_new(options: &S3StorageOptions) -> Result<Self, DynamoDbConfigError> {
-        let dynamodb_client = create_dynamodb_client(&options)?;
+        // async lock client construction would lead to a flood of other functions transitively
+        // becoming async as well, and since our delta table serde depends on reconstructing lock
+        // clients, and this is rare, blocking the entire execution thread is a trade-off we're
+        // willing to make.
+        // let handle = tokio::runtime::Handle::current();
+        // let options2 = std::sync::Arc::new(options.clone());
+        // let dynamodb_client = futures::executor::block_on(async move {
+        //     handle.spawn(async move { create_dynamodb_client(&options2).await }).await
+        // })
+        // .expect("creating AWS configuration failed")?;
+        // let dynamodb_client = tokio::task::block_in_place(|| create_dynamodb_client(&options))?;
+        // let options2 = sync::Arc::new(options.clone());
+        // let dynamodb_client = futures::executor::block_on(tokio::task::spawn(async move {
+        //     create_dynamodb_client(&options2).await
+        // }))
+        // .expect("creating AWS configuration failed")?;
+        let dynamodb_client = futures::executor::block_on(create_dynamodb_client(&options))?;
         let lock_table_name = options
             .extra_opts
             .get(constants::LOCK_TABLE_KEY_NAME)
@@ -61,40 +74,45 @@ impl DynamoDbLockClient {
     /// it's not immediately useable. This method does not wait for the table state to become
     /// `active`, so transient failures might occurr when immediately using the lock client.
     pub async fn try_create_lock_table(&self) -> Result<CreateLockTableResult, LockClientError> {
-        let attribute_definitions = vec![
-            AttributeDefinition {
-                attribute_name: constants::ATTR_TABLE_PATH.to_owned(),
-                attribute_type: constants::STRING_TYPE.to_owned(),
-            },
-            AttributeDefinition {
-                attribute_name: constants::ATTR_FILE_NAME.to_owned(),
-                attribute_type: constants::STRING_TYPE.to_owned(),
-            },
-        ];
-        let input = CreateTableInput {
-            attribute_definitions,
-            key_schema: vec![
-                KeySchemaElement {
-                    attribute_name: constants::ATTR_TABLE_PATH.to_owned(),
-                    key_type: constants::KEY_TYPE_HASH.to_owned(),
-                },
-                KeySchemaElement {
-                    attribute_name: constants::ATTR_FILE_NAME.to_owned(),
-                    key_type: constants::KEY_TYPE_RANGE.to_owned(),
-                },
-            ],
-            billing_mode: Some(self.config.billing_mode.to_str()),
-            table_name: self.config.lock_table_name.clone(),
-            ..Default::default()
-        };
-        match self.dynamodb_client.create_table(input).await {
+        let response = self
+            .dynamodb_client
+            .create_table()
+            .attribute_definitions(
+                AttributeDefinition::builder()
+                    .attribute_name(constants::ATTR_TABLE_PATH)
+                    .attribute_type(ScalarAttributeType::S)
+                    .build()?,
+            )
+            .attribute_definitions(
+                AttributeDefinition::builder()
+                    .attribute_name(constants::ATTR_FILE_NAME)
+                    .attribute_type(ScalarAttributeType::S)
+                    .build()?,
+            )
+            .key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name(constants::ATTR_TABLE_PATH)
+                    .key_type(KeyType::Hash)
+                    .build()?,
+            )
+            .key_schema(
+                KeySchemaElement::builder()
+                    .attribute_name(constants::ATTR_FILE_NAME)
+                    .key_type(KeyType::Range)
+                    .build()?,
+            )
+            .billing_mode(self.config.billing_mode.into())
+            .table_name(self.config.lock_table_name.clone())
+            .send()
+            .await;
+
+        match response {
             Ok(_) => Ok(CreateLockTableResult::TableCreated),
-            Err(RusotoError::Service(CreateTableError::ResourceInUse(_))) => {
+            Err(SdkError::ServiceError(err)) if err.err().is_resource_in_use_exception() => {
                 Ok(CreateLockTableResult::TableAlreadyExists)
             }
-            Err(reason) => Err(LockClientError::LockTableCreateFailure {
-                name: self.config.lock_table_name.clone(),
-                source: reason,
+            Err(reason) => Err(LockClientError::GenericDynamoDb {
+                source: Box::new(reason),
             }),
         }
     }
@@ -104,11 +122,15 @@ impl DynamoDbLockClient {
         self.config.lock_table_name.clone()
     }
 
-    fn get_primary_key(&self, version: i64, table_path: &str) -> HashMap<String, AttributeValue> {
-        maplit::hashmap! {
-            constants::ATTR_TABLE_PATH.to_owned()  => string_attr(table_path),
-            constants::ATTR_FILE_NAME.to_owned()   => string_attr(format!("{:020}.json", version)),
-        }
+    fn get_primary_key(
+        &self,
+        version: i64,
+        table_path: &str,
+    ) -> Option<HashMap<String, AttributeValue>> {
+        Some(maplit::hashmap! {
+            constants::ATTR_TABLE_PATH.to_owned()  => AttributeValue::S(table_path.to_owned()),
+            constants::ATTR_FILE_NAME.to_owned()   => AttributeValue::S(format!("{:020}.json", version)),
+        })
     }
 
     /// Read a log entry from DynamoDb.
@@ -117,13 +139,15 @@ impl DynamoDbLockClient {
         table_path: &str,
         version: i64,
     ) -> Result<Option<CommitEntry>, LockClientError> {
-        let input = GetItemInput {
-            consistent_read: Some(true),
-            table_name: self.config.lock_table_name.clone(),
-            key: self.get_primary_key(version, table_path),
-            ..Default::default()
-        };
-        let item = self.dynamodb_client.get_item(input).await?;
+        let item = self
+            .dynamodb_client
+            .get_item()
+            .consistent_read(true)
+            .table_name(self.config.lock_table_name.clone())
+            .set_key(self.get_primary_key(version, table_path))
+            .send()
+            .await?;
+
         item.item.as_ref().map(CommitEntry::try_from).transpose()
     }
 
@@ -134,24 +158,30 @@ impl DynamoDbLockClient {
         entry: &CommitEntry,
     ) -> Result<(), LockClientError> {
         let item = create_value_map(&entry, table_path);
-        let input = PutItemInput {
-            condition_expression: Some(constants::CONDITION_EXPR_CREATE.to_owned()),
-            table_name: self.get_lock_table_name(),
-            item,
-            ..Default::default()
-        };
-        match self.dynamodb_client.put_item(input).await {
+        let response = self
+            .dynamodb_client
+            .put_item()
+            .condition_expression(constants::CONDITION_EXPR_CREATE.to_owned())
+            .table_name(self.get_lock_table_name())
+            .set_item(Some(item))
+            .send()
+            .await;
+        match response {
             Ok(_) => Ok(()),
-            Err(RusotoError::Service(PutItemError::ConditionalCheckFailed(_))) => {
+            Err(SdkError::ServiceError(err))
+                if err.err().is_conditional_check_failed_exception() =>
+            {
                 Err(LockClientError::VersionAlreadyExists {
                     table_path: table_path.to_owned(),
                     version: entry.version,
                 })
             }
-            Err(RusotoError::Service(PutItemError::ProvisionedThroughputExceeded(_))) => {
+            Err(SdkError::ServiceError(err))
+                if err.err().is_provisioned_throughput_exceeded_exception() =>
+            {
                 Err(LockClientError::ProvisionedThroughputExceeded)
             }
-            Err(RusotoError::Service(PutItemError::ResourceNotFound(_))) => {
+            Err(SdkError::ServiceError(err)) if err.err().is_resource_not_found_exception() => {
                 Err(LockClientError::LockTableNotFound)
             }
             Err(err) => Err(err.into()),
@@ -174,20 +204,19 @@ impl DynamoDbLockClient {
     pub async fn get_latest_entries(
         &self,
         table_path: &str,
-        limit: i64,
+        limit: i32,
     ) -> Result<Vec<CommitEntry>, LockClientError> {
-        let input = QueryInput {
-            table_name: self.get_lock_table_name(),
-            consistent_read: Some(true),
-            limit: Some(limit),
-            scan_index_forward: Some(false),
-            key_condition_expression: Some(format!("{} = :tn", constants::ATTR_TABLE_PATH)),
-            expression_attribute_values: Some(
-                maplit::hashmap!(":tn".into() => string_attr(table_path)),
-            ),
-            ..Default::default()
-        };
-        let query_result = self.dynamodb_client.query(input).await?;
+        let query_result = self
+            .dynamodb_client
+            .query()
+            .table_name(self.get_lock_table_name())
+            .consistent_read(true)
+            .limit(limit)
+            .scan_index_forward(false)
+            .key_condition_expression(format!("{} = :tn", constants::ATTR_TABLE_PATH))
+            .expression_attribute_values(":tn", AttributeValue::S(table_path.to_owned()))
+            .send()
+            .await?;
         query_result
             .items
             .unwrap()
@@ -207,22 +236,25 @@ impl DynamoDbLockClient {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let input = UpdateItemInput {
-            table_name: self.get_lock_table_name(),
-            key: self.get_primary_key(version, table_path),
-            update_expression: Some("SET complete = :c, expireTime = :e".to_owned()),
-            expression_attribute_values: Some(maplit::hashmap! {
-                ":c".to_owned() => string_attr("true"),
-                ":e".to_owned() => num_attr(seconds_since_epoch),
-                ":f".into() => string_attr("false"),
-            }),
-            condition_expression: Some(constants::CONDITION_UPDATE_INCOMPLETE.to_owned()),
-            ..Default::default()
-        };
-
-        match self.dynamodb_client.update_item(input).await {
+        let response = self
+            .dynamodb_client
+            .update_item()
+            .table_name(self.get_lock_table_name())
+            .set_key(self.get_primary_key(version, table_path))
+            .update_expression("SET complete = :c, expireTime = :e".to_owned())
+            .set_expression_attribute_values(Some(maplit::hashmap! {
+                ":c".to_owned() => AttributeValue::S(true.to_string()),
+                ":e".to_owned() => AttributeValue::N(seconds_since_epoch.to_string()),
+                ":f".into() => AttributeValue::S(false.to_string()),
+            }))
+            .condition_expression(constants::CONDITION_UPDATE_INCOMPLETE.to_owned())
+            .send()
+            .await;
+        match response {
             Ok(_) => Ok(UpdateLogEntryResult::UpdatePerformed),
-            Err(RusotoError::Service(UpdateItemError::ConditionalCheckFailed(_))) => {
+            Err(SdkError::ServiceError(err))
+                if err.err().is_conditional_check_failed_exception() =>
+            {
                 Ok(UpdateLogEntryResult::AlreadyCompleted)
             }
             Err(err) => Err(err)?,
@@ -288,33 +320,24 @@ fn create_value_map(
     // cut off `_delta_log` part: temp_path in DynamoDb is relative to `_delta_log` not table root.
     let temp_path = Path::from_iter(commit_entry.temp_path.parts().skip(1));
     let mut value_map = maplit::hashmap! {
-        constants::ATTR_TABLE_PATH.to_owned()  => string_attr(table_path),
-        constants::ATTR_FILE_NAME.to_owned()   => string_attr(format!("{:020}.json", commit_entry.version)),
-        constants::ATTR_TEMP_PATH.to_owned()   => string_attr(&temp_path),
-        constants::ATTR_COMPLETE.to_owned()    => string_attr(if commit_entry.complete { "true" } else { "false" }),
+        constants::ATTR_TABLE_PATH.to_owned()  => AttributeValue::S(table_path.to_owned()),
+        constants::ATTR_FILE_NAME.to_owned()   => AttributeValue::S(format!("{:020}.json", commit_entry.version)),
+        constants::ATTR_TEMP_PATH.to_owned()   => AttributeValue::S(temp_path.to_string()),
+        constants::ATTR_COMPLETE.to_owned()    => AttributeValue::S(if commit_entry.complete { true.to_string() } else { false.to_string() }),
     };
     commit_entry.expire_time.as_ref().map(|t| {
         value_map.insert(
             constants::ATTR_EXPIRE_TIME.to_owned(),
-            num_attr(system_time_to_epoch(t)),
+            AttributeValue::N(system_time_to_epoch(t).to_string()),
         )
     });
     value_map
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Copy, Clone)]
 enum BillingMode {
     PayPerRequest,
     Provisioned,
-}
-
-impl BillingMode {
-    fn to_str(&self) -> String {
-        match self {
-            Self::PayPerRequest => "PAY_PER_REQUEST".to_owned(),
-            Self::Provisioned => "PROVISIONED".to_owned(),
-        }
-    }
 }
 
 impl FromStr for BillingMode {
@@ -325,6 +348,15 @@ impl FromStr for BillingMode {
             "provisioned" => Ok(BillingMode::Provisioned),
             "pay_per_request" => Ok(BillingMode::PayPerRequest),
             _ => Err(DynamoDbConfigError::InvalidBillingMode(s.to_owned())),
+        }
+    }
+}
+
+impl From<BillingMode> for aws_sdk_dynamodb::types::BillingMode {
+    fn from(bm: BillingMode) -> Self {
+        match bm {
+            BillingMode::Provisioned => aws_sdk_dynamodb::types::BillingMode::Provisioned,
+            BillingMode::PayPerRequest => aws_sdk_dynamodb::types::BillingMode::PayPerRequest,
         }
     }
 }
@@ -350,11 +382,6 @@ mod constants {
     pub const ATTR_COMPLETE: &str = "complete";
     pub const ATTR_EXPIRE_TIME: &str = "expireTime";
 
-    pub const STRING_TYPE: &str = "S";
-
-    pub const KEY_TYPE_HASH: &str = "HASH";
-    pub const KEY_TYPE_RANGE: &str = "RANGE";
-
     lazy_static! {
         pub static ref CONDITION_EXPR_CREATE: String = format!(
             "attribute_not_exists({ATTR_TABLE_PATH}) and attribute_not_exists({ATTR_FILE_NAME})"
@@ -366,19 +393,26 @@ mod constants {
     pub const DEFAULT_COMMIT_ENTRY_EXPIRATION_DELAY: Duration = Duration::from_secs(86_400);
 }
 
-fn create_dynamodb_client(
-    options: &S3StorageOptions,
-) -> Result<DynamoDbClient, DynamoDbConfigError> {
+async fn create_dynamodb_client(options: &S3StorageOptions) -> Result<Client, DynamoDbConfigError> {
+    // aws_config::environment::credentials
+    let mut config = aws_config::defaults(aws_config::BehaviorVersion::v2023_11_09());
+    if let Some(endpoint_url) = std::env::var("AWS_ENDPOINT_URL").ok() {
+        config = config.endpoint_url(endpoint_url);
+    }
+    let config = config.load().await;
     Ok(match options.use_web_identity {
         true => {
-            let dispatcher = HttpClient::new()?;
-            rusoto_dynamodb::DynamoDbClient::new_with(
-                dispatcher,
-                get_web_identity_provider()?,
-                options.region.clone(),
-            )
+            // TODO/twh; check the http client in config, maybe?
+            // let _dispatcher = rusoto_core::HttpClient::new()?;
+            // let _http_client = aws_sdk_dynamodb::config::HttpClient::http_connector(&self, settings, components)
+            Client::new(&config)
+            // rusoto_dynamodb::DynamoDbClient::new_with(
+            //     dispatcher,
+            //     get_web_identity_provider()?,
+            //     options.region.clone(),
+            // )
         }
-        false => rusoto_dynamodb::DynamoDbClient::new(options.region.clone()),
+        false => Client::new(&config),
     })
 }
 
@@ -393,12 +427,11 @@ fn extract_required_string_field<'a>(
         .ok_or_else(|| LockClientError::InconsistentData {
             description: format!("mandatory string field '{field_name}' missing"),
         })?
-        .s
-        .as_ref()
-        .ok_or_else(|| LockClientError::InconsistentData {
+        .as_s()
+        .map_err(|e| LockClientError::InconsistentData {
             description: format!(
-                "mandatory string field '{field_name}' exists, but is not a string: {:#?}",
-                fields.get(field_name)
+                "mandatory string field '{field_name}', but is not a string: {:?}",
+                e
             ),
         })
         .map(|s| s.as_str())
@@ -413,36 +446,21 @@ fn extract_optional_number_field<'a>(
     fields
         .get(field_name)
         .map(|attr| {
-            attr.n
-                .as_ref()
-                .ok_or_else(|| LockClientError::InconsistentData {
-                    description: format!(
-                        "field with name '{field_name}' exists, but is not of type number"
-                    ),
-                })
+            attr.as_n().map_err(|e| LockClientError::InconsistentData {
+                description: format!(
+                    "field with name '{field_name}' exists, but is not of type number: {:?}",
+                    e
+                ),
+            })
         })
         .transpose()
 }
 
-fn string_attr<T: ToString>(s: T) -> AttributeValue {
-    AttributeValue {
-        s: Some(s.to_string()),
-        ..Default::default()
-    }
-}
-
-fn num_attr<T: ToString>(n: T) -> AttributeValue {
-    AttributeValue {
-        n: Some(n.to_string()),
-        ..Default::default()
-    }
-}
-
-fn get_web_identity_provider(
-) -> Result<AutoRefreshingProvider<WebIdentityProvider>, DynamoDbConfigError> {
-    let provider = WebIdentityProvider::from_k8s_env();
-    Ok(AutoRefreshingProvider::new(provider)?)
-}
+// fn get_web_identity_provider(
+// ) -> Result<AutoRefreshingProvider<WebIdentityProvider>, DynamoDbConfigError> {
+//     let provider = WebIdentityProvider::from_k8s_env();
+//     Ok(AutoRefreshingProvider::new(provider)?)
+// }
 
 #[cfg(test)]
 mod tests {

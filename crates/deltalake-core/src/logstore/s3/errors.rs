@@ -1,7 +1,8 @@
 //! Errors for S3 log store backed by DynamoDb
 
+use aws_sdk_dynamodb::error::{BuildError, SdkError};
 use rusoto_core::RusotoError;
-use rusoto_dynamodb::{CreateTableError, GetItemError, PutItemError, QueryError, UpdateItemError};
+use rusoto_dynamodb::{GetItemError, PutItemError, QueryError};
 
 #[derive(thiserror::Error, Debug, PartialEq)]
 pub enum DynamoDbConfigError {
@@ -31,12 +32,6 @@ pub enum DynamoDbConfigError {
 pub enum LockClientError {
     #[error("Log item has invalid content: '{description}'")]
     InconsistentData { description: String },
-
-    #[error("Lock table '{name}': creation failed: {source}")]
-    LockTableCreateFailure {
-        name: String,
-        source: RusotoError<CreateTableError>,
-    },
 
     #[error("Log entry for table '{table_path}' and version '{version}' already exists")]
     VersionAlreadyExists { table_path: String, version: i64 },
@@ -102,25 +97,44 @@ impl From<PutItemError> for LockClientError {
     }
 }
 
-impl From<UpdateItemError> for LockClientError {
-    fn from(err: UpdateItemError) -> Self {
-        match err {
-            UpdateItemError::ConditionalCheckFailed(_) => {
-                unreachable!("condition check failure in update is not an error")
-            }
-            UpdateItemError::InternalServerError(_) => err.into(),
-            UpdateItemError::ProvisionedThroughputExceeded(_) => {
-                LockClientError::ProvisionedThroughputExceeded
-            }
-            UpdateItemError::RequestLimitExceeded(_) => {
-                LockClientError::ProvisionedThroughputExceeded
-            }
-            UpdateItemError::ResourceNotFound(_) => LockClientError::LockTableNotFound,
-            UpdateItemError::ItemCollectionSizeLimitExceeded(_) => err.into(),
-            UpdateItemError::TransactionConflict(_) => err.into(),
-        }
-    }
-}
+// impl From<UpdateItemError> for LockClientError {
+//     fn from(err: UpdateItemError) -> Self {
+//         match err {
+//             UpdateItemError::ConditionalCheckFailed(_) => {
+//                 unreachable!("condition check failure in update is not an error")
+//             }
+//             UpdateItemError::InternalServerError(_) => err.into(),
+//             UpdateItemError::ProvisionedThroughputExceeded(_) => {
+//                 LockClientError::ProvisionedThroughputExceeded
+//             }
+//             UpdateItemError::RequestLimitExceeded(_) => {
+//                 LockClientError::ProvisionedThroughputExceeded
+//             }
+//             UpdateItemError::ResourceNotFound(_) => LockClientError::LockTableNotFound,
+//             UpdateItemError::ItemCollectionSizeLimitExceeded(_) => err.into(),
+//             UpdateItemError::TransactionConflict(_) => err.into(),
+//         }
+//     }
+// }
+
+// impl From<UpdateItemError> for LockClientError {
+//     fn from(err: UpdateItemError) -> Self {
+//         match err {
+//             UpdateItemError::ConditionalCheckFailedException(_) => {
+//                 unreachable!("condition check failure in update is not an error")
+//             }
+//             UpdateItemError::InternalServerError(_) => err.into(),
+//             UpdateItemError::InvalidEndpointException(_) => todo!(),
+//             UpdateItemError::ItemCollectionSizeLimitExceededException(_) => todo!(),
+//             UpdateItemError::ProvisionedThroughputExceededException(_) => todo!(),
+//             UpdateItemError::RequestLimitExceeded(_) => todo!(),
+//             UpdateItemError::ResourceNotFoundException(_) => todo!(),
+//             UpdateItemError::TransactionConflictException(_) => todo!(),
+//             &_ => todo!(),
+//         }
+//         todo!()
+//     }
+// }
 
 impl<E> From<RusotoError<E>> for LockClientError
 where
@@ -133,6 +147,33 @@ where
             _ => LockClientError::GenericDynamoDb {
                 source: Box::new(err),
             },
+        }
+    }
+}
+
+impl<E, R> From<SdkError<E, R>> for LockClientError
+where
+    // E: Into<LockClientError> + std::error::Error + Send + Sync + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+    R: std::fmt::Debug + Send + Sync + 'static,
+{
+    fn from(err: SdkError<E, R>) -> Self {
+        match err {
+            // SdkError::ServiceError(ServiceError { error, body }) => error.into(),
+            // SdkError::ServiceError(se) => {
+            //     se.into_err().into()
+            // }
+            _ => LockClientError::GenericDynamoDb {
+                source: Box::new(err),
+            },
+        }
+    }
+}
+
+impl From<BuildError> for LockClientError {
+    fn from(err: BuildError) -> Self {
+        LockClientError::GenericDynamoDb {
+            source: Box::new(err),
         }
     }
 }
